@@ -7,59 +7,100 @@
 #include <esp_arduino_version.h>
 #endif
 
+// ============================================================
+// ESP32-CAM CAR: HIGHER FPS WEB STREAM + LEFT/RIGHT MOTOR SPEED
+// Board: AI Thinker ESP32-CAM
+//
+// Web page:
+//   http://10.76.104.1/
+//
+// Camera stream:
+//   http://10.76.104.1:81/stream
+//
+// Motor speed:
+//   Controlled by PWM on existing L298N IN pins.
+//   No extra ENA/ENB GPIO required.
+// ============================================================
+
 // ---------------- AI THINKER ESP32-CAM PIN MAP ----------------
-#define PWDN_GPIO_NUM     32
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM      0
-#define SIOD_GPIO_NUM     26
-#define SIOC_GPIO_NUM     27
+#define PWDN_GPIO_NUM 32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 0
+#define SIOD_GPIO_NUM 26
+#define SIOC_GPIO_NUM 27
 
-#define Y9_GPIO_NUM       35
-#define Y8_GPIO_NUM       34
-#define Y7_GPIO_NUM       39
-#define Y6_GPIO_NUM       36
-#define Y5_GPIO_NUM       21
-#define Y4_GPIO_NUM       19
-#define Y3_GPIO_NUM       18
-#define Y2_GPIO_NUM        5
+#define Y9_GPIO_NUM 35
+#define Y8_GPIO_NUM 34
+#define Y7_GPIO_NUM 39
+#define Y6_GPIO_NUM 36
+#define Y5_GPIO_NUM 21
+#define Y4_GPIO_NUM 19
+#define Y3_GPIO_NUM 18
+#define Y2_GPIO_NUM 5
 
-#define VSYNC_GPIO_NUM    25
-#define HREF_GPIO_NUM     23
-#define PCLK_GPIO_NUM     22
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM 23
+#define PCLK_GPIO_NUM 22
 
 // ---------------- L298N MOTOR PINS ----------------
+// Current wiring from your original code.
 #define RIGHT_IN1 4
 #define RIGHT_IN2 13
-#define LEFT_IN3  14
-#define LEFT_IN4  15
+#define LEFT_IN3 14
+#define LEFT_IN4 15
 
 // ---------------- PAN/TILT SERVO PINS ----------------
-// IO2 = pan
-// U0R / GPIO3 = tilt
-// Disconnect tilt signal while uploading code.
-#define PAN_SERVO_PIN   2
-#define TILT_SERVO_PIN  3
+// GPIO3 is UART RX. Disconnect tilt servo signal while uploading code.
+#define PAN_SERVO_PIN 2
+#define TILT_SERVO_PIN 3
 
 #define SERVO_MIN_US 500
 #define SERVO_MAX_US 2400
+
+// ---------------- CAR DIRECTION ----------------
+#define STOP 0
+#define UP 1
+#define DOWN 2
+#define LEFT 3
+#define RIGHT 4
+
+// ---------------- CAMERA FPS SETTINGS ----------------
+// QVGA 320x240 is a good balance.
+// For maximum FPS, change CAMERA_FRAME_SIZE to FRAMESIZE_QQVGA and quality to 24.
+#define CAMERA_FRAME_SIZE FRAMESIZE_QVGA
+#define CAMERA_JPEG_QUALITY 20 // Higher number = lower quality = faster
+#define STREAM_DELAY_MS 10     // Lower = higher stream rate, more Wi-Fi load
+
+// ---------------- MOTOR PWM SETTINGS ----------------
+#define MOTOR_PWM_FREQ 1200
+#define MOTOR_PWM_RESOLUTION 8
+#define MOTOR_MAX_DUTY 255
+
+// Use LEDC channels away from camera channel 0.
+#define RIGHT_IN1_CH 4
+#define RIGHT_IN2_CH 5
+#define LEFT_IN3_CH 6
+#define LEFT_IN4_CH 7
+
+// Default speed. If your left motor is faster, lower leftMotorSpeed from page.
+int leftMotorSpeed = 200;
+int rightMotorSpeed = 200;
+
+// Minimum active speed helps weak motors start moving.
+// Set to 0 if your car moves smoothly at very low speed.
+int minMotorDuty = 80;
+
+const char *ssid = "MyWiFiCar";
+const char *password = "12345678";
+
+WebServer server(80);
+WiFiServer streamServer(81);
 
 Servo panServo;
 Servo tiltServo;
 
 int panAngle = 90;
 int tiltAngle = 90;
-
-// ---------------- CAR DIRECTION ----------------
-#define STOP  0
-#define UP    1
-#define DOWN  2
-#define LEFT  3
-#define RIGHT 4
-
-const char* ssid = "MyWiFiCar";
-const char* password = "12345678";
-
-WebServer server(80);
 
 int currentDir = STOP;
 bool carPowerOn = true;
@@ -73,7 +114,7 @@ int motionScore = 0;
 unsigned long lastDetectionMs = 0;
 
 // ---------------- HTML PAGE ----------------
-const char* htmlHomePage = R"rawliteral(
+const char *htmlHomePage = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
@@ -81,6 +122,11 @@ const char* htmlHomePage = R"rawliteral(
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 
 <style>
+* {
+  box-sizing: border-box;
+  touch-action: manipulation;
+}
+
 body {
   margin: 0;
   padding: 10px;
@@ -94,6 +140,7 @@ body {
 
 h2 {
   margin: 8px 0 10px 0;
+  font-size: 22px;
 }
 
 .video-box {
@@ -144,7 +191,7 @@ h2 {
   border: 2px solid #008000;
   border-radius: 14px;
   font-weight: bold;
-  font-size: 18px;
+  font-size: 17px;
 }
 
 .detect-box.alarm {
@@ -190,6 +237,34 @@ h2 {
   max-width: 500px;
 }
 
+.motor-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  max-width: 1000px;
+  margin: 10px auto;
+}
+
+.motor-card {
+  padding: 12px;
+  background: #fff;
+  border: 1px solid #777;
+  border-radius: 14px;
+  font-weight: bold;
+}
+
+.motor-card input {
+  width: 90%;
+}
+
+.trim-row {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
 .pad {
   display: grid;
   grid-template-columns: 76px 76px 76px;
@@ -217,6 +292,15 @@ h2 {
   box-shadow: none;
 }
 
+.small-btn {
+  width: auto;
+  height: 44px;
+  min-width: 82px;
+  padding: 0 12px;
+  font-size: 14px;
+  color: cyan;
+}
+
 .power-btn {
   width: 160px;
   height: 60px;
@@ -229,14 +313,19 @@ h2 {
   color: cyan;
 }
 
+.stop-btn {
+  color: #ff3333;
+}
+
 .small-note {
   font-size: 13px;
   color: #555;
   margin-top: 8px;
 }
 
-@media (max-width: 600px) {
-  .info-row {
+@media (max-width: 700px) {
+  .info-row,
+  .motor-grid {
     grid-template-columns: 1fr;
   }
 
@@ -248,11 +337,11 @@ h2 {
 </head>
 
 <body>
-<h2>ESP32-CAM Car — Faster Detection + Pan/Tilt</h2>
+<h2>ESP32-CAM Car — MJPEG FPS + Motor Speed Balance</h2>
 
 <div class="video-box" id="videoBox">
   <div class="camera-wrap">
-    <img id="cam" src="/jpg?t=0" alt="Camera">
+    <img id="cam" crossorigin="anonymous" src="" alt="Camera Stream">
     <canvas id="overlayCanvas"></canvas>
   </div>
 </div>
@@ -263,15 +352,43 @@ h2 {
 
 <div class="info-row">
   <div class="status" id="status">Ready</div>
-  <div class="fps-box" id="fpsBox">FPS: starting...</div>
+  <div class="fps-box" id="fpsBox">Stream: MJPEG mode</div>
 </div>
 
 <div class="small-note" id="modeText">
   Loading ESP32-CAM status...
 </div>
 
+<div class="motor-grid">
+  <div class="motor-card">
+    Left Motor Speed:
+    <span id="leftSpeedVal">200</span> / 255
+    <br>
+    <input type="range" min="0" max="255" value="200" id="leftSpeedSlider"
+      oninput="setMotorSpeed('LeftSpeed', this.value)">
+    <div class="trim-row">
+      <button class="btn small-btn" onclick="trimMotor('left', -5)">Left -5</button>
+      <button class="btn small-btn" onclick="trimMotor('left', 5)">Left +5</button>
+    </div>
+  </div>
+
+  <div class="motor-card">
+    Right Motor Speed:
+    <span id="rightSpeedVal">200</span> / 255
+    <br>
+    <input type="range" min="0" max="255" value="200" id="rightSpeedSlider"
+      oninput="setMotorSpeed('RightSpeed', this.value)">
+    <div class="trim-row">
+      <button class="btn small-btn" onclick="trimMotor('right', -5)">Right -5</button>
+      <button class="btn small-btn" onclick="trimMotor('right', 5)">Right +5</button>
+    </div>
+  </div>
+</div>
+
 <div class="control-box">
   <button class="btn power-btn" id="powerBtn" onclick="togglePower()">POWER ON</button>
+  <button class="btn small-btn" onclick="toggleDetection()">Detection: <span id="detectToggleText">ON</span></button>
+  <button class="btn small-btn" onclick="reloadStream()">Reload Cam</button>
 
   <div class="slider-row">
     Pan:
@@ -309,7 +426,7 @@ h2 {
     LEFT
   </button>
 
-  <button class="btn" onclick="stopDrive()">STOP</button>
+  <button class="btn stop-btn" onclick="stopDrive()">STOP</button>
 
   <button class="btn"
     onmousedown="drive(4)" onmouseup="stopDrive()" onmouseleave="stopDrive()"
@@ -328,42 +445,32 @@ h2 {
   <div></div>
 </div>
 
-<canvas id="detectCanvas" width="96" height="72" style="display:none;"></canvas>
+<div class="small-note">
+  Tip: If the car curves right while moving forward, the left motor is probably faster. Lower Left Motor Speed or raise Right Motor Speed.
+</div>
+
+<canvas id="detectCanvas" width="64" height="48" style="display:none;"></canvas>
 
 <script>
-// Faster FPS settings.
-// If Wi-Fi becomes unstable, change refreshDelay to 120.
-var refreshDelay = 95;
-var minRefreshDelay = 80;
-var maxRefreshDelay = 300;
-
-var imageBusy = false;
-var refreshTimer = null;
-
-var frameCounter = 0;
-var fpsFrameCount = 0;
-var fpsLastTime = Date.now();
-var stableFpsValue = 0;
-
-var lastImageStartTime = 0;
-var imageTimeoutMs = 1800;
-
-var successFrameCount = 0;
-var errorFrameCount = 0;
-
 var powerOn = true;
 window.currentMoving = false;
 
 var lastServoSendTime = 0;
 var servoSendDelay = 120;
 
-// Detection settings
-var smallW = 96;
-var smallH = 72;
+var lastMotorSpeedSendTime = 0;
+var motorSpeedSendDelay = 90;
+
+var detectionEnabled = true;
+var detectionInterval = 280;
+
+// Detection settings: smaller canvas = faster browser performance.
+var smallW = 64;
+var smallH = 48;
 
 var pixelDiffThreshold = 34;
-var changedPixelTrigger = 560;
-var minBoxArea = 90;
+var changedPixelTrigger = 180;
+var minBoxArea = 40;
 var maxChangedRatio = 0.55;
 
 var previousGray = null;
@@ -374,25 +481,26 @@ function statusText(msg) {
   document.getElementById("status").innerText = msg;
 }
 
-function sendCmd(k, v) {
-  var xhr = new XMLHttpRequest();
-  xhr.open("GET", "/cmd?k=" + encodeURIComponent(k) + "&v=" + encodeURIComponent(v) + "&t=" + Date.now(), true);
+function reloadStream() {
+  var img = document.getElementById("cam");
+  img.src = "http://" + location.hostname + ":81/stream?t=" + Date.now();
+  statusText("Reloading MJPEG stream...");
+}
 
-  xhr.onreadystatechange = function() {
-    if (xhr.readyState == 4) {
-      if (xhr.status == 200) {
+function sendCmd(k, v) {
+  fetch("/cmd?k=" + encodeURIComponent(k) + "&v=" + encodeURIComponent(v) + "&t=" + Date.now(), {
+    cache: "no-store"
+  })
+    .then(function(response) {
+      if (response.ok) {
         statusText("OK: " + k + " = " + v);
       } else {
-        statusText("Command failed");
+        statusText("Command failed: " + k);
       }
-    }
-  };
-
-  xhr.onerror = function() {
-    statusText("Send failed");
-  };
-
-  xhr.send();
+    })
+    .catch(function() {
+      statusText("Send failed: " + k);
+    });
 }
 
 function updatePowerButton() {
@@ -419,13 +527,52 @@ function togglePower() {
   }
 }
 
+function setMotorSpeed(k, v) {
+  v = Math.max(0, Math.min(255, Number(v)));
+
+  if (k == "LeftSpeed") {
+    document.getElementById("leftSpeedVal").innerText = v;
+    document.getElementById("leftSpeedSlider").value = v;
+  }
+
+  if (k == "RightSpeed") {
+    document.getElementById("rightSpeedVal").innerText = v;
+    document.getElementById("rightSpeedSlider").value = v;
+  }
+
+  var now = Date.now();
+
+  if (now - lastMotorSpeedSendTime < motorSpeedSendDelay) {
+    return;
+  }
+
+  lastMotorSpeedSendTime = now;
+  sendCmd(k, v);
+}
+
+function trimMotor(side, delta) {
+  if (side == "left") {
+    var s = document.getElementById("leftSpeedSlider");
+    var v = Math.max(0, Math.min(255, Number(s.value) + delta));
+    setMotorSpeed("LeftSpeed", v);
+  } else {
+    var s2 = document.getElementById("rightSpeedSlider");
+    var v2 = Math.max(0, Math.min(255, Number(s2.value) + delta));
+    setMotorSpeed("RightSpeed", v2);
+  }
+}
+
 function sliderServo(k, v) {
+  v = Math.max(0, Math.min(180, Number(v)));
+
   if (k == "Pan") {
     document.getElementById("panVal").innerText = v;
+    document.getElementById("panSlider").value = v;
   }
 
   if (k == "Tilt") {
     document.getElementById("tiltVal").innerText = v;
+    document.getElementById("tiltSlider").value = v;
   }
 
   var now = Date.now();
@@ -439,11 +586,8 @@ function sliderServo(k, v) {
 }
 
 function centerPanTilt() {
-  document.getElementById("panSlider").value = 90;
-  document.getElementById("tiltSlider").value = 90;
-  document.getElementById("panVal").innerText = 90;
-  document.getElementById("tiltVal").innerText = 90;
-
+  sliderServo("Pan", 90);
+  sliderServo("Tilt", 90);
   sendCmd("Center", 1);
 }
 
@@ -468,96 +612,45 @@ function stopDrive() {
   sendCmd("MoveCar", 0);
 }
 
+function toggleDetection() {
+  detectionEnabled = !detectionEnabled;
+  document.getElementById("detectToggleText").innerText = detectionEnabled ? "ON" : "OFF";
+  previousGray = null;
+  clearRoundedBox();
+  updateDetectionUI(false, 0);
+}
+
 function updateStatusFromESP32() {
-  var xhr = new XMLHttpRequest();
-  xhr.open("GET", "/data?t=" + Date.now(), true);
+  fetch("/data?t=" + Date.now(), { cache: "no-store" })
+    .then(function(response) { return response.json(); })
+    .then(function(data) {
+      powerOn = data.power;
+      updatePowerButton();
 
-  xhr.onreadystatechange = function() {
-    if (xhr.readyState == 4 && xhr.status == 200) {
-      try {
-        var data = JSON.parse(xhr.responseText);
+      document.getElementById("panSlider").value = data.pan;
+      document.getElementById("tiltSlider").value = data.tilt;
+      document.getElementById("panVal").innerText = data.pan;
+      document.getElementById("tiltVal").innerText = data.tilt;
 
-        powerOn = data.power;
-        updatePowerButton();
+      document.getElementById("leftSpeedSlider").value = data.leftSpeed;
+      document.getElementById("rightSpeedSlider").value = data.rightSpeed;
+      document.getElementById("leftSpeedVal").innerText = data.leftSpeed;
+      document.getElementById("rightSpeedVal").innerText = data.rightSpeed;
 
-        document.getElementById("panSlider").value = data.pan;
-        document.getElementById("tiltSlider").value = data.tilt;
-        document.getElementById("panVal").innerText = data.pan;
-        document.getElementById("tiltVal").innerText = data.tilt;
-
-        document.getElementById("modeText").innerText =
-          "Camera: " + data.cameraMode +
-          " | Ready: " + data.cameraReady +
-          " | PSRAM: " + data.psram +
-          " | Power: " + data.power +
-          " | Pan: " + data.pan +
-          " | Tilt: " + data.tilt +
-          " | Motion: " + data.motion +
-          " | Score: " + data.score +
-          " | Delay: " + refreshDelay + " ms";
-      } catch (e) {
-        console.log(e);
-      }
-    }
-  };
-
-  xhr.send();
-}
-
-function refreshImage() {
-  var now = Date.now();
-
-  if (imageBusy && now - lastImageStartTime > imageTimeoutMs) {
-    imageBusy = false;
-    errorFrameCount++;
-    successFrameCount = 0;
-
-    refreshDelay = Math.min(maxRefreshDelay, refreshDelay + 35);
-    statusText("Camera slow. Stabilizing...");
-  }
-
-  if (imageBusy) {
-    scheduleNextFrame();
-    return;
-  }
-
-  imageBusy = true;
-  lastImageStartTime = Date.now();
-
-  var img = document.getElementById("cam");
-  img.src = "/jpg?t=" + lastImageStartTime;
-}
-
-function scheduleNextFrame() {
-  if (refreshTimer !== null) {
-    clearTimeout(refreshTimer);
-  }
-
-  refreshTimer = setTimeout(refreshImage, refreshDelay);
-}
-
-function updateFPS() {
-  fpsFrameCount++;
-
-  var now = Date.now();
-  var elapsed = now - fpsLastTime;
-
-  if (elapsed >= 1000) {
-    var fps = fpsFrameCount * 1000 / elapsed;
-
-    if (stableFpsValue === 0) {
-      stableFpsValue = fps;
-    } else {
-      stableFpsValue = stableFpsValue * 0.75 + fps * 0.25;
-    }
-
-    document.getElementById("fpsBox").innerText =
-      "Real FPS: " + stableFpsValue.toFixed(1) +
-      " | delay: " + refreshDelay + " ms";
-
-    fpsFrameCount = 0;
-    fpsLastTime = now;
-  }
+      document.getElementById("modeText").innerText =
+        "Camera: " + data.cameraMode +
+        " | Ready: " + data.cameraReady +
+        " | PSRAM: " + data.psram +
+        " | Power: " + data.power +
+        " | Direction: " + data.direction +
+        " | Left speed: " + data.leftSpeed +
+        " | Right speed: " + data.rightSpeed +
+        " | Motion: " + data.motion +
+        " | Score: " + data.score;
+    })
+    .catch(function(e) {
+      console.log(e);
+    });
 }
 
 function sendDetectionToESP32(detected, score) {
@@ -571,19 +664,26 @@ function sendDetectionToESP32(detected, score) {
   lastSentDetection = v;
   lastSendTime = now;
 
-  var xhr = new XMLHttpRequest();
-  xhr.open("GET", "/detect?v=" + v + "&score=" + score + "&t=" + Date.now(), true);
-  xhr.send();
+  fetch("/detect?v=" + v + "&score=" + score + "&t=" + Date.now(), {
+    cache: "no-store"
+  }).catch(function() {});
 }
 
 function updateDetectionUI(detected, score) {
   var box = document.getElementById("detectBox");
   var videoBox = document.getElementById("videoBox");
 
+  if (!detectionEnabled) {
+    box.classList.remove("alarm");
+    videoBox.classList.remove("alarm");
+    box.innerText = "Detection: OFF";
+    return;
+  }
+
   if (detected) {
     box.classList.add("alarm");
     videoBox.classList.add("alarm");
-    box.innerText = "Detection: OBJECT / MOTION CHANGE DETECTED | score = " + score;
+    box.innerText = "Detection: MOTION CHANGE DETECTED | score = " + score;
   } else {
     box.classList.remove("alarm");
     videoBox.classList.remove("alarm");
@@ -614,12 +714,11 @@ function drawRoundedBox(x, y, w, h, score) {
   var bw = w * scaleX;
   var bh = h * scaleY;
 
-  // Bigger rounded detection box
-  var radius = 26;
+  var radius = 20;
 
-  ctx.lineWidth = 6;
+  ctx.lineWidth = 5;
   ctx.strokeStyle = "red";
-  ctx.fillStyle = "rgba(255, 0, 0, 0.18)";
+  ctx.fillStyle = "rgba(255, 0, 0, 0.16)";
 
   ctx.beginPath();
   ctx.moveTo(bx + radius, by);
@@ -636,9 +735,9 @@ function drawRoundedBox(x, y, w, h, score) {
   ctx.fill();
   ctx.stroke();
 
-  ctx.font = "bold 20px Arial";
+  ctx.font = "bold 18px Arial";
   ctx.fillStyle = "red";
-  ctx.fillText("Object Change: " + score, bx + 10, Math.max(by - 10, 24));
+  ctx.fillText("Motion: " + score, bx + 10, Math.max(by - 10, 22));
 }
 
 function clearRoundedBox() {
@@ -646,13 +745,18 @@ function clearRoundedBox() {
   var overlay = document.getElementById("overlayCanvas");
   var ctx = overlay.getContext("2d");
 
-  overlay.width = img.clientWidth;
-  overlay.height = img.clientHeight;
+  overlay.width = img.clientWidth || 1;
+  overlay.height = img.clientHeight || 1;
 
   ctx.clearRect(0, 0, overlay.width, overlay.height);
 }
 
 function analyzeCameraFrame() {
+  if (!detectionEnabled) {
+    clearRoundedBox();
+    return;
+  }
+
   if (window.currentMoving === true) {
     previousGray = null;
     updateDetectionUI(false, 0);
@@ -664,6 +768,10 @@ function analyzeCameraFrame() {
   var img = document.getElementById("cam");
   var canvas = document.getElementById("detectCanvas");
   var ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+  if (!img.naturalWidth || !img.naturalHeight) {
+    return;
+  }
 
   try {
     ctx.drawImage(img, 0, 0, smallW, smallH);
@@ -686,7 +794,6 @@ function analyzeCameraFrame() {
     }
 
     var changedPixels = 0;
-
     var minX = smallW;
     var minY = smallH;
     var maxX = 0;
@@ -711,7 +818,6 @@ function analyzeCameraFrame() {
     previousGray = gray;
 
     var changedRatio = changedPixels / (smallW * smallH);
-
     var boxW = maxX - minX;
     var boxH = maxY - minY;
     var boxArea = boxW * boxH;
@@ -725,89 +831,151 @@ function analyzeCameraFrame() {
     sendDetectionToESP32(detected, changedPixels);
 
     if (detected) {
-      // Bigger padding around detected object
-      var padding = 12;
+      var padding = 6;
 
       minX = Math.max(0, minX - padding);
       minY = Math.max(0, minY - padding);
       maxX = Math.min(smallW - 1, maxX + padding);
       maxY = Math.min(smallH - 1, maxY + padding);
 
-      boxW = maxX - minX;
-      boxH = maxY - minY;
-
-      drawRoundedBox(minX, minY, boxW, boxH, changedPixels);
+      drawRoundedBox(minX, minY, maxX - minX, maxY - minY, changedPixels);
     } else {
       clearRoundedBox();
     }
-
   } catch (e) {
     console.log("Detection error:", e);
+    updateDetectionUI(false, 0);
   }
 }
 
+// Keyboard control.
+document.addEventListener("keydown", function(e) {
+  if (e.repeat) return;
+
+  var k = e.key.toLowerCase();
+
+  if (k === "w") drive(1);
+  else if (k === "s") drive(2);
+  else if (k === "a") drive(3);
+  else if (k === "d") drive(4);
+  else if (k === " " || k === "x") stopDrive();
+  else if (k === "j") sliderServo("Pan", Number(document.getElementById("panSlider").value) - 5);
+  else if (k === "l") sliderServo("Pan", Number(document.getElementById("panSlider").value) + 5);
+  else if (k === "i") sliderServo("Tilt", Number(document.getElementById("tiltSlider").value) + 5);
+  else if (k === "k") sliderServo("Tilt", Number(document.getElementById("tiltSlider").value) - 5);
+  else if (k === "c") centerPanTilt();
+});
+
+document.addEventListener("keyup", function(e) {
+  var k = e.key.toLowerCase();
+
+  if (k === "w" || k === "a" || k === "s" || k === "d") {
+    stopDrive();
+  }
+});
+
 document.getElementById("cam").onload = function() {
-  imageBusy = false;
-
-  frameCounter++;
-  successFrameCount++;
-  errorFrameCount = 0;
-
-  updateFPS();
-
-  if (successFrameCount >= 20) {
-    refreshDelay = Math.max(minRefreshDelay, refreshDelay - 10);
-    successFrameCount = 0;
-  }
-
-  // Detection every 15 frames to keep FPS higher.
-  if (frameCounter % 15 == 0) {
-    analyzeCameraFrame();
-  }
-
-  scheduleNextFrame();
+  statusText("MJPEG stream loaded");
+  document.getElementById("fpsBox").innerText = "Stream: MJPEG on port 81";
 };
 
 document.getElementById("cam").onerror = function() {
-  imageBusy = false;
-  successFrameCount = 0;
-  errorFrameCount++;
-
-  refreshDelay = Math.min(maxRefreshDelay, refreshDelay + 40);
-
-  document.getElementById("fpsBox").innerText =
-    "Real FPS: image error | delay: " + refreshDelay + " ms";
-
-  scheduleNextFrame();
+  statusText("Camera stream error. Press Reload Cam.");
+  document.getElementById("fpsBox").innerText = "Stream error";
 };
 
 updatePowerButton();
+reloadStream();
 updateStatusFromESP32();
 setInterval(updateStatusFromESP32, 3000);
-setTimeout(refreshImage, 500);
+setInterval(analyzeCameraFrame, detectionInterval);
 </script>
 </body>
 </html>
 )rawliteral";
 
-// ---------------- SERVO LOGIC ----------------
-int clampAngle(int angle) {
-  if (angle < 0) return 0;
-  if (angle > 180) return 180;
-  return angle;
+// ---------------- UTILITY ----------------
+int clampInt(int value, int low, int high)
+{
+  if (value < low)
+    return low;
+  if (value > high)
+    return high;
+  return value;
 }
 
-void setPan(int angle) {
+int speedToDuty(int speedValue)
+{
+  speedValue = clampInt(speedValue, 0, MOTOR_MAX_DUTY);
+
+  if (speedValue == 0)
+  {
+    return 0;
+  }
+
+  if (speedValue < minMotorDuty)
+  {
+    return minMotorDuty;
+  }
+
+  return speedValue;
+}
+
+// ---------------- PWM COMPATIBILITY ----------------
+void motorPwmAttach(int pin, int channel)
+{
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttachChannel(pin, MOTOR_PWM_FREQ, MOTOR_PWM_RESOLUTION, channel);
+#else
+  ledcSetup(channel, MOTOR_PWM_FREQ, MOTOR_PWM_RESOLUTION);
+  ledcAttachPin(pin, channel);
+#endif
+}
+
+void motorPwmWrite(int pin, int channel, int duty)
+{
+  duty = clampInt(duty, 0, MOTOR_MAX_DUTY);
+
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(pin, duty);
+#else
+  ledcWrite(channel, duty);
+#endif
+}
+
+void setupMotorPwm()
+{
+  motorPwmAttach(RIGHT_IN1, RIGHT_IN1_CH);
+  motorPwmAttach(RIGHT_IN2, RIGHT_IN2_CH);
+  motorPwmAttach(LEFT_IN3, LEFT_IN3_CH);
+  motorPwmAttach(LEFT_IN4, LEFT_IN4_CH);
+
+  motorPwmWrite(RIGHT_IN1, RIGHT_IN1_CH, 0);
+  motorPwmWrite(RIGHT_IN2, RIGHT_IN2_CH, 0);
+  motorPwmWrite(LEFT_IN3, LEFT_IN3_CH, 0);
+  motorPwmWrite(LEFT_IN4, LEFT_IN4_CH, 0);
+}
+
+// ---------------- SERVO LOGIC ----------------
+int clampAngle(int angle)
+{
+  return clampInt(angle, 0, 180);
+}
+
+void setPan(int angle)
+{
   panAngle = clampAngle(angle);
   panServo.write(panAngle);
 }
 
-void setTilt(int angle) {
+void setTilt(int angle)
+{
   tiltAngle = clampAngle(angle);
   tiltServo.write(tiltAngle);
 }
 
-void setupServos() {
+void setupServos()
+{
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
   ESP32PWM::allocateTimer(3);
@@ -825,48 +993,105 @@ void setupServos() {
 }
 
 // ---------------- MOTOR LOGIC ----------------
-void moveCar(int v) {
-  if (!carPowerOn) {
+void stopMotors()
+{
+  motorPwmWrite(RIGHT_IN1, RIGHT_IN1_CH, 0);
+  motorPwmWrite(RIGHT_IN2, RIGHT_IN2_CH, 0);
+  motorPwmWrite(LEFT_IN3, LEFT_IN3_CH, 0);
+  motorPwmWrite(LEFT_IN4, LEFT_IN4_CH, 0);
+}
+
+void setRightForward(int duty)
+{
+  motorPwmWrite(RIGHT_IN1, RIGHT_IN1_CH, duty);
+  motorPwmWrite(RIGHT_IN2, RIGHT_IN2_CH, 0);
+}
+
+void setRightBackward(int duty)
+{
+  motorPwmWrite(RIGHT_IN1, RIGHT_IN1_CH, 0);
+  motorPwmWrite(RIGHT_IN2, RIGHT_IN2_CH, duty);
+}
+
+void setLeftForward(int duty)
+{
+  motorPwmWrite(LEFT_IN3, LEFT_IN3_CH, duty);
+  motorPwmWrite(LEFT_IN4, LEFT_IN4_CH, 0);
+}
+
+void setLeftBackward(int duty)
+{
+  motorPwmWrite(LEFT_IN3, LEFT_IN3_CH, 0);
+  motorPwmWrite(LEFT_IN4, LEFT_IN4_CH, duty);
+}
+
+void moveCar(int v)
+{
+  if (!carPowerOn)
+  {
+    v = STOP;
+  }
+
+  if (v < STOP || v > RIGHT)
+  {
     v = STOP;
   }
 
   currentDir = v;
 
-  if (v == UP) {
-    digitalWrite(RIGHT_IN1, HIGH);
-    digitalWrite(RIGHT_IN2, LOW);
-    digitalWrite(LEFT_IN3, HIGH);
-    digitalWrite(LEFT_IN4, LOW);
+  int leftDuty = speedToDuty(leftMotorSpeed);
+  int rightDuty = speedToDuty(rightMotorSpeed);
+
+  if (v == UP)
+  {
+    setRightForward(rightDuty);
+    setLeftForward(leftDuty);
   }
-  else if (v == DOWN) {
-    digitalWrite(RIGHT_IN1, LOW);
-    digitalWrite(RIGHT_IN2, HIGH);
-    digitalWrite(LEFT_IN3, LOW);
-    digitalWrite(LEFT_IN4, HIGH);
+  else if (v == DOWN)
+  {
+    setRightBackward(rightDuty);
+    setLeftBackward(leftDuty);
   }
-  else if (v == LEFT) {
-    digitalWrite(RIGHT_IN1, HIGH);
-    digitalWrite(RIGHT_IN2, LOW);
-    digitalWrite(LEFT_IN3, LOW);
-    digitalWrite(LEFT_IN4, HIGH);
+  else if (v == LEFT)
+  {
+    setRightForward(rightDuty);
+    setLeftBackward(leftDuty);
   }
-  else if (v == RIGHT) {
-    digitalWrite(RIGHT_IN1, LOW);
-    digitalWrite(RIGHT_IN2, HIGH);
-    digitalWrite(LEFT_IN3, HIGH);
-    digitalWrite(LEFT_IN4, LOW);
+  else if (v == RIGHT)
+  {
+    setRightBackward(rightDuty);
+    setLeftForward(leftDuty);
   }
-  else {
+  else
+  {
     currentDir = STOP;
-    digitalWrite(RIGHT_IN1, LOW);
-    digitalWrite(RIGHT_IN2, LOW);
-    digitalWrite(LEFT_IN3, LOW);
-    digitalWrite(LEFT_IN4, LOW);
+    stopMotors();
+  }
+}
+
+void updateLeftSpeed(int value)
+{
+  leftMotorSpeed = clampInt(value, 0, MOTOR_MAX_DUTY);
+
+  if (currentDir != STOP)
+  {
+    moveCar(currentDir);
+  }
+}
+
+void updateRightSpeed(int value)
+{
+  rightMotorSpeed = clampInt(value, 0, MOTOR_MAX_DUTY);
+
+  if (currentDir != STOP)
+  {
+    moveCar(currentDir);
   }
 }
 
 // ---------------- CAMERA SETUP ----------------
-void setupCamera() {
+void setupCamera()
+{
   camera_config_t config = {};
 
   bool hasPsram = psramFound();
@@ -902,20 +1127,41 @@ void setupCamera() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
-  // Faster QVGA mode.
-  config.frame_size = FRAMESIZE_QVGA;
-  config.jpeg_quality = 14;
+  config.frame_size = CAMERA_FRAME_SIZE;
+  config.jpeg_quality = CAMERA_JPEG_QUALITY;
   config.fb_count = hasPsram ? 2 : 1;
 
-  if (hasPsram) {
-    cameraMode = "QVGA 320x240 fast FPS, quality 14, PSRAM";
-  } else {
-    cameraMode = "QVGA 320x240 fast FPS, quality 14, no PSRAM";
+#if defined(CAMERA_GRAB_LATEST)
+  config.grab_mode = CAMERA_GRAB_LATEST;
+#endif
+
+#if defined(CAMERA_FB_IN_PSRAM)
+  if (hasPsram)
+  {
+    config.fb_location = CAMERA_FB_IN_PSRAM;
   }
+#endif
+
+  if (CAMERA_FRAME_SIZE == FRAMESIZE_QQVGA)
+  {
+    cameraMode = "QQVGA 160x120 MJPEG, quality ";
+  }
+  else if (CAMERA_FRAME_SIZE == FRAMESIZE_QVGA)
+  {
+    cameraMode = "QVGA 320x240 MJPEG, quality ";
+  }
+  else
+  {
+    cameraMode = "MJPEG, quality ";
+  }
+
+  cameraMode += String(CAMERA_JPEG_QUALITY);
+  cameraMode += hasPsram ? ", PSRAM" : ", no PSRAM";
 
   esp_err_t err = esp_camera_init(&config);
 
-  if (err != ESP_OK) {
+  if (err != ESP_OK)
+  {
     Serial.printf("Camera init failed with error 0x%x\n", err);
     cameraReady = false;
     cameraMode = "Camera init failed";
@@ -924,9 +1170,10 @@ void setupCamera() {
 
   sensor_t *sensor = esp_camera_sensor_get();
 
-  if (sensor != NULL) {
-    sensor->set_framesize(sensor, FRAMESIZE_QVGA);
-    sensor->set_quality(sensor, 14);
+  if (sensor != NULL)
+  {
+    sensor->set_framesize(sensor, CAMERA_FRAME_SIZE);
+    sensor->set_quality(sensor, CAMERA_JPEG_QUALITY);
 
     sensor->set_vflip(sensor, 1);
     sensor->set_hmirror(sensor, 0);
@@ -948,19 +1195,23 @@ void setupCamera() {
 }
 
 // ---------------- CAMERA IMAGE HANDLER ----------------
-void handleJpg() {
-  if (!cameraReady) {
+void handleJpg()
+{
+  if (!cameraReady)
+  {
     server.send(503, "text/plain", "Camera not ready");
     return;
   }
 
   camera_fb_t *fb = esp_camera_fb_get();
 
-  if (!fb) {
+  if (!fb)
+  {
     server.send(500, "text/plain", "Camera capture failed");
     return;
   }
 
+  server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
   server.sendHeader("Pragma", "no-cache");
   server.sendHeader("Expires", "0");
@@ -974,9 +1225,103 @@ void handleJpg() {
   esp_camera_fb_return(fb);
 }
 
+// ---------------- MJPEG STREAM HANDLER ON PORT 81 ----------------
+void streamTask(void *param)
+{
+  streamServer.begin();
+
+  while (true)
+  {
+    WiFiClient client = streamServer.available();
+
+    if (!client)
+    {
+      vTaskDelay(10 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    client.setNoDelay(true);
+
+    // Read request headers.
+    unsigned long headerStart = millis();
+    String currentLine = "";
+
+    while (client.connected() && millis() - headerStart < 1200)
+    {
+      if (!client.available())
+      {
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+        continue;
+      }
+
+      char c = client.read();
+
+      if (c == '\n')
+      {
+        if (currentLine.length() <= 1)
+        {
+          break;
+        }
+        currentLine = "";
+      }
+      else if (c != '\r')
+      {
+        currentLine += c;
+      }
+    }
+
+    client.print("HTTP/1.1 200 OK\r\n");
+    client.print("Content-Type: multipart/x-mixed-replace; boundary=frame\r\n");
+    client.print("Access-Control-Allow-Origin: *\r\n");
+    client.print("Cache-Control: no-cache, no-store, must-revalidate\r\n");
+    client.print("Pragma: no-cache\r\n");
+    client.print("Expires: 0\r\n");
+    client.print("Connection: close\r\n\r\n");
+
+    while (client.connected())
+    {
+      if (!cameraReady)
+      {
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        continue;
+      }
+
+      camera_fb_t *fb = esp_camera_fb_get();
+
+      if (!fb)
+      {
+        vTaskDelay(30 / portTICK_PERIOD_MS);
+        continue;
+      }
+
+      client.print("--frame\r\n");
+      client.print("Content-Type: image/jpeg\r\n");
+      client.print("Content-Length: ");
+      client.print(fb->len);
+      client.print("\r\n\r\n");
+
+      size_t written = client.write(fb->buf, fb->len);
+      client.print("\r\n");
+
+      esp_camera_fb_return(fb);
+
+      if (written == 0)
+      {
+        break;
+      }
+
+      vTaskDelay(STREAM_DELAY_MS / portTICK_PERIOD_MS);
+    }
+
+    client.stop();
+  }
+}
+
 // ---------------- COMMAND HANDLER ----------------
-void handleCommand() {
-  if (!server.hasArg("k") || !server.hasArg("v")) {
+void handleCommand()
+{
+  if (!server.hasArg("k") || !server.hasArg("v"))
+  {
     server.send(400, "text/plain", "Missing k or v");
     return;
   }
@@ -984,36 +1329,46 @@ void handleCommand() {
   String key = server.arg("k");
   int value = server.arg("v").toInt();
 
-  Serial.print("Command: ");
-  Serial.print(key);
-  Serial.print(" = ");
-  Serial.println(value);
-
-  if (key == "MoveCar") {
-    if (value < STOP || value > RIGHT) {
-      value = STOP;
-    }
-
+  if (key == "MoveCar")
+  {
     moveCar(value);
   }
-  else if (key == "Power") {
+  else if (key == "Power")
+  {
     carPowerOn = value == 1;
 
-    if (!carPowerOn) {
+    if (!carPowerOn)
+    {
       moveCar(STOP);
     }
   }
-  else if (key == "Pan") {
+  else if (key == "Pan")
+  {
     setPan(value);
   }
-  else if (key == "Tilt") {
+  else if (key == "Tilt")
+  {
     setTilt(value);
   }
-  else if (key == "Center") {
+  else if (key == "Center")
+  {
     setPan(90);
     setTilt(90);
   }
-  else {
+  else if (key == "LeftSpeed")
+  {
+    updateLeftSpeed(value);
+  }
+  else if (key == "RightSpeed")
+  {
+    updateRightSpeed(value);
+  }
+  else if (key == "MinDuty")
+  {
+    minMotorDuty = clampInt(value, 0, MOTOR_MAX_DUTY);
+  }
+  else
+  {
     server.send(400, "text/plain", "Unknown command");
     return;
   }
@@ -1022,8 +1377,10 @@ void handleCommand() {
 }
 
 // ---------------- DETECTION HANDLER ----------------
-void handleDetection() {
-  if (!server.hasArg("v")) {
+void handleDetection()
+{
+  if (!server.hasArg("v"))
+  {
     server.send(400, "text/plain", "Missing v");
     return;
   }
@@ -1031,22 +1388,19 @@ void handleDetection() {
   int v = server.arg("v").toInt();
   motionDetected = (v == 1);
 
-  if (server.hasArg("score")) {
+  if (server.hasArg("score"))
+  {
     motionScore = server.arg("score").toInt();
   }
 
   lastDetectionMs = millis();
 
-  Serial.print("Detection: ");
-  Serial.print(motionDetected ? "OBJECT / MOTION CHANGE DETECTED" : "no object change");
-  Serial.print(" | score = ");
-  Serial.println(motionScore);
-
   server.send(200, "text/plain", "OK");
 }
 
 // ---------------- DATA JSON HANDLER ----------------
-void handleData() {
+void handleData()
+{
   String json = "{";
   json += "\"cameraReady\":";
   json += (cameraReady ? "true" : "false");
@@ -1069,6 +1423,15 @@ void handleData() {
   json += "\"tilt\":";
   json += String(tiltAngle);
   json += ",";
+  json += "\"leftSpeed\":";
+  json += String(leftMotorSpeed);
+  json += ",";
+  json += "\"rightSpeed\":";
+  json += String(rightMotorSpeed);
+  json += ",";
+  json += "\"minDuty\":";
+  json += String(minMotorDuty);
+  json += ",";
   json += "\"motion\":";
   json += (motionDetected ? "true" : "false");
   json += ",";
@@ -1083,22 +1446,25 @@ void handleData() {
 }
 
 // ---------------- PIN SETUP ----------------
-void setupPins() {
+void setupPins()
+{
   pinMode(RIGHT_IN1, OUTPUT);
   pinMode(RIGHT_IN2, OUTPUT);
   pinMode(LEFT_IN3, OUTPUT);
   pinMode(LEFT_IN4, OUTPUT);
 
-  moveCar(STOP);
+  setupMotorPwm();
+  stopMotors();
 }
 
 // ---------------- WIFI SETUP ----------------
-void setupWiFi() {
+void setupWiFi()
+{
   WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
-  // Channel 6, visible SSID, max 1 connected client.
+  // Try channel 1, 6, or 11 if your area has Wi-Fi interference.
   bool ok = WiFi.softAP(ssid, password, 6, 0, 1);
 
   Serial.print("softAP status: ");
@@ -1112,12 +1478,13 @@ void setupWiFi() {
 }
 
 // ---------------- SETUP ----------------
-void setup() {
+void setup()
+{
   Serial.begin(115200);
   delay(1000);
 
   Serial.println();
-  Serial.println("Starting ESP32-CAM faster object detection pan/tilt car...");
+  Serial.println("Starting ESP32-CAM MJPEG motor-balance car...");
 
   setupPins();
   setupWiFi();
@@ -1125,18 +1492,25 @@ void setup() {
   setupCamera();
   setupServos();
 
-  server.on("/", HTTP_GET, []() {
+  server.on("/", HTTP_GET, []()
+            {
     server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-    server.send(200, "text/html", htmlHomePage);
-  });
+    server.send(200, "text/html", htmlHomePage); });
 
   server.on("/jpg", HTTP_GET, handleJpg);
   server.on("/cmd", HTTP_GET, handleCommand);
   server.on("/detect", HTTP_GET, handleDetection);
   server.on("/data", HTTP_GET, handleData);
 
-  server.on("/test", HTTP_GET, []() {
+  server.on("/test", HTTP_GET, []()
+            {
     String msg = "ESP32-CAM web server OK\n";
+    msg += "Open page: http://";
+    msg += WiFi.softAPIP().toString();
+    msg += "/\n";
+    msg += "MJPEG stream: http://";
+    msg += WiFi.softAPIP().toString();
+    msg += ":81/stream\n";
     msg += "Camera ready: ";
     msg += cameraReady ? "YES\n" : "NO\n";
     msg += "Camera mode: ";
@@ -1146,6 +1520,12 @@ void setup() {
     msg += psramFound() ? "YES\n" : "NO\n";
     msg += "Power: ";
     msg += carPowerOn ? "ON\n" : "OFF\n";
+    msg += "Left speed: ";
+    msg += String(leftMotorSpeed);
+    msg += "\n";
+    msg += "Right speed: ";
+    msg += String(rightMotorSpeed);
+    msg += "\n";
     msg += "Pan angle: ";
     msg += String(panAngle);
     msg += "\n";
@@ -1157,18 +1537,27 @@ void setup() {
     msg += "Score: ";
     msg += String(motionScore);
     msg += "\n";
-    msg += "Open /jpg to test camera image directly\n";
 
-    server.send(200, "text/plain", msg);
-  });
+    server.send(200, "text/plain", msg); });
 
   server.begin();
+  Serial.println("HTTP control server started on port 80.");
 
-  Serial.println("Server started.");
+  xTaskCreatePinnedToCore(
+      streamTask,
+      "streamTask",
+      8192,
+      NULL,
+      1,
+      NULL,
+      0);
+
+  Serial.println("MJPEG stream server started on port 81.");
 }
 
 // ---------------- LOOP ----------------
-void loop() {
+void loop()
+{
   server.handleClient();
   delay(1);
 }
